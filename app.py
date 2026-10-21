@@ -6,7 +6,28 @@ import pandas as pd
 import uuid
 import streamlit as st
 from ultralytics import YOLO
-from preprocess import preprocess_frame
+def apply_safe_haze_pipeline(frame, brightness_threshold=70, t_min=0.25):
+    """Safely applies 4-step haze filter with automatic daylight bypass."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if np.mean(gray) > brightness_threshold:
+        return frame  # Bypass filter during bright daylight to prevent blackouts
+
+    img_float = frame.astype(np.float32) / 255.0
+    dark_channel = np.min(img_float, axis=2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    dark_channel = cv2.erode(dark_channel, kernel)
+    
+    A = np.max(dark_channel) + 1e-6
+    transmission = np.maximum(1.0 - 0.95 * (dark_channel / A), t_min)
+    transmission_3ch = np.repeat(transmission[:, :, np.newaxis], 3, axis=2)
+    
+    recovered = (img_float - A) / np.maximum(transmission_3ch, 0.1) + A
+    return np.clip(recovered * 255.0, 0, 255).astype(np.uint8)
+
+def apply_gamma_correction(frame, gamma=1.5):
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(frame, table)
 
 # Load the trained/pretrained model
 model = YOLO("yolov8s.pt")
@@ -35,9 +56,8 @@ st.write(
 def init_db():
   conn = sqlite3.connect("border_events.db", check_same_thread=False)
   cursor = conn.cursor()
-  cursor.execute("DROP TABLE IF EXISTS intrusions")
   cursor.execute("""
-        CREATE TABLE intrusions (
+        CREATE TABLE IF NOT EXISTS intrusions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             camera_id TEXT,
@@ -86,6 +106,23 @@ radio_frequency = st.sidebar.text_input(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("📜 Persistent Records Archive")
+with st.sidebar.expander("📂 View Saved Database Logs"):
+    # Sidebar contains complete historical records across all time
+    df_sidebar_history = pd.read_sql_query(
+        """
+        SELECT timestamp, object_type, person_id, event_type, guard_status, location 
+        FROM intrusions 
+        ORDER BY id DESC
+        """, 
+        db_conn
+    )
+    if not df_sidebar_history.empty:
+        st.dataframe(df_sidebar_history, use_container_width=True)
+    else:
+        st.info("No logs saved in database yet.")
+        
+st.sidebar.markdown("---")
 st.sidebar.subheader("🛡️ Boundary Configuration")
 fence_mode = st.sidebar.radio(
     "Select Intrusion Zone Type", ["Vector Line Crossing", "Polygon Zone"]
@@ -112,14 +149,26 @@ with st.sidebar.form("threshold_form"):
     max_heading_deviation = st.slider("Max Heading Deviation (Degrees)", 10, 90, 45)
     cooldown_period_sec = st.slider("Alert Cooldown Period (Seconds)", 5, 60, 15)
     
+    st.markdown("---")
+    st.markdown("**Threat Snapshot Delay Time**")
+    col_m, col_s = st.columns(2)
+    with col_m:
+        ss_minutes = st.number_input("Minutes", min_value=0, max_value=60, value=0, step=1)
+    with col_s:
+        ss_seconds = st.number_input("Seconds", min_value=0, max_value=59, value=3, step=1)
+    
     submitted = st.form_submit_button("Apply Thresholds")
 
 if submitted:
-    st.session_state.loitering_threshold = loitering_threshold_sec
+    st.session_state.loitering_threshold = loiterson = loitering_threshold_sec
     st.session_state.erratic_sensitivity = erratic_velocity_spike
     st.session_state.max_heading_deviation = max_heading_deviation
     st.session_state.alert_cooldown = cooldown_period_sec
-    st.success("Settings applied!")
+    
+    # Calculate total combined delay in seconds (e.g., 1 min 30 sec = 90 seconds)
+    st.session_state.screenshot_delay = (ss_minutes * 60) + ss_seconds
+    
+    st.success(f"Settings applied! Total SS Delay: {st.session_state.screenshot_delay}s")
 
 st.sidebar.subheader("Environmental Filters")
 enable_advanced_filters = st.sidebar.checkbox(
@@ -147,7 +196,9 @@ if "active_threats" not in st.session_state:
   st.session_state.active_threats = set()
 if "track_history" not in st.session_state:
   st.session_state.track_history = {}
-
+# Capture session start time the moment the script runs
+if "session_start_time" not in st.session_state:
+  st.session_state.session_start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 # --- TAB 1: BASE STATION MONITORING & FIELD CONFIRMATION ---
 with tab1:
   col1, col2 = st.columns([2, 1])
@@ -199,8 +250,24 @@ if run_system:
 
       # --- ENVIRONMENTAL & ADVANCED PREPROCESSING ---
       if enable_advanced_filters:
-          frame = preprocess_frame(frame)
+          # Check frame brightness first; bypass if it's normal daylight to prevent blackouts
+          gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+          if np.mean(gray) <= 70:
+              img_float = frame.astype(np.float32) / 255.0
+              dark_channel = np.min(img_float, axis=2)
+              kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+              dark_channel = cv2.erode(dark_channel, kernel)
+              A = np.max(dark_channel) + 1e-6
+              # Transmission floor (t_min=0.25) prevents over-subtraction
+              transmission = np.maximum(1.0 - 0.95 * (dark_channel / A), 0.25)
+              transmission_3ch = np.repeat(transmission[:, :, np.newaxis], 3, axis=2)
+              recovered = (img_float - A) / np.maximum(transmission_3ch, 0.1) + A
+              frame = np.clip(recovered * 255.0, 0, 255).astype(np.uint8)
 
+      if enable_gamma:
+          inv_gamma = 1.0 / 1.5
+          table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+          frame = cv2.LUT(frame, table)
       # --- BYTETRACK MULTI-OBJECT TRACKING ---
       results = model.track(
           frame,
@@ -340,6 +407,22 @@ if run_system:
               current_time_dt - track_data["entry_time"]
           ).total_seconds()
 
+          # --- SCREENSHOT CAPTURE LOGIC FOR PERSISTENT THREATS ---
+          # Fetch the combined delay from session state (defaults to 3 seconds if not set)
+          ss_threshold = getattr(st.session_state, 'screenshot_delay', 3)
+            
+            # Triggers once the object stays longer than the combined minutes + seconds limit
+          if time_spent_sec >= ss_threshold and not track_data.get("screenshot_taken", False):
+                track_data["screenshot_taken"] = True
+                
+                # Format timestamp for a safe filename
+                safe_time_str = current_time_str.replace(":", "-").replace(" ", "_")
+                filename = f"threat_ss_{track_str}_{safe_time_str}.jpg"
+                
+                # Save the snapshot locally using your exact safety fallback
+                cv2.imwrite(filename, annotated_file if 'annotated_file' in locals() else annotated_frame) 
+          # -------------------------------------------------------
+
           if time_spent_sec >= loitering_threshold_sec:
             event_type = "LOITERING THREAT"
           elif velocity_delta >= erratic_velocity_spike:
@@ -436,16 +519,18 @@ if run_system:
                       
                       if col2.button(f"Confirm True Threat ({t_id})", key=btn_key_true):
                           t_data["guard_status"] = "CONFIRMED TRUE THREAT"
-                          
+                                      
                       if col3.button(f"Mark False Alarm ({t_id})", key=btn_key_false):
                           t_data["guard_status"] = "FALSE ALARM DISMISSED"
           else:
               st.info("No active field alerts requiring radio confirmation at this moment.")
       # Fetch logs for Analytics Tab
+      current_session_start = st.session_state.session_start_time
       df_logs = pd.read_sql_query(
-          """
+          f"""
                 SELECT timestamp, object_type, person_id, event_type, time_spent, guard_status, location 
                 FROM intrusions 
+                WHERE timestamp >= '{current_session_start}'
                 ORDER BY id DESC
             """,
           db_conn,
