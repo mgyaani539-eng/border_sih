@@ -1,0 +1,8 @@
+dataset/
+runs/
+videos/
+sample video/
+__pycache__/
+*.pt
+*.onnx
+*.db
